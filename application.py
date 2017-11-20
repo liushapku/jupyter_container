@@ -11,6 +11,7 @@ from jupyter_client.ioloop import IOLoopKernelManager
 from jupyter_core import version_info
 
 from traceback import format_exc
+import atexit
 
 from jupyter_container.kernelmanager import (
     ProxyMultiKernelManager,
@@ -84,6 +85,40 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
 
         atexit.register(self.kernel_manager.cleanup_connection_file)
 
+    def init_kernel_client(self):
+        if self.kernel_manager is not None:
+            self.kernel_client = self.kernel_manager.client()
+        else:
+            self.kernel_client = self.kernel_client_class(
+                                session=self.session,
+                                ip=self.ip,
+                                transport=self.transport,
+                                shell_port=self.shell_port,
+                                iopub_port=self.iopub_port,
+                                stdin_port=self.stdin_port,
+                                hb_port=self.hb_port,
+                                connection_file=self.connection_file,
+                                parent=self,
+            )
+        self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
+        self.kernel_client.iopub_channel.call_handlers = self.on_iopub_msg
+        self.kernel_client.stdin_channel.call_handlers = self.on_stdin_msg
+        self.kernel_client.hb_channel.call_handlers = self.on_hb_msg
+        self.kernel_client.start_channels()
+
+    def on_shell_msg(self, msg):
+        pass
+
+    def on_iopub_msg(self, msg):
+        pass
+
+    def on_stdin_msg(self, msg):
+        pass
+
+    def on_hb_msg(self, msg):
+        pass
+
+
 class JupyterChildApp(JupyterApp, JupyterChildConsoleApp):
     kernel_manager_class = ThreadedIOLoopKernelManager
     aliases = JupyterChildConsoleApp.aliases
@@ -124,17 +159,17 @@ class JupyterContainerApp(JupyterApp):
         """Return the number of running kernels."""
         return len(self._child_apps)
 
-    def __contains__(self, bufno):
-        return bufno in self._child_apps
+    def __contains__(self, childid):
+        return childid in self._child_apps
 
     def init_kernel_manager(self):
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
         self.kernel_manager = self.kernel_manager_factory(
             parent=self,
             log=self.log,
         )
+        atexit.register(self.cleanup_kernels)
 
-    def get_bufapp(self, childid):
+    def get_child_app(self, childid):
         return self._child_apps.get(childid)
 
 
@@ -146,16 +181,23 @@ class JupyterContainerApp(JupyterApp):
             return
         self.init_kernel_manager()
 
+    def cleanup_kernels(self):
+        """Shutdown all kernels.
+
+        The kernels will shutdown themselves when this process no longer exists,
+        but explicit shutdown allows the KernelManagers to cleanup the connection files.
+        """
+        self.log.info('shutting down all kernels')
+        self.kernel_manager.shutdown_all()
 
     def start_child_app(self, childid, argv=None, **kwargs):
         if childid in self:
             assert argv is None or '--existing' not in argv, \
                 'chilid is already associated with a kernel, --existing is not valid'
             logger.warning('BufApp %d already started', childid)
-            return self._bufapps[childid]
+            return self._child_apps[childid]
         if 'log' not in kwargs:
             kwargs['log'] = self.log
-        self.log.warning('=====')
         childapp = self.child_app_factory(**kwargs)
         childapp.initialize(self, childid, argv)
 
