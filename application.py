@@ -24,7 +24,7 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
     aliases = JupyterConsoleApp.aliases
     flags = JupyterConsoleApp.flags
 
-    kernel_client_factory = ThreadedKernelClient
+    # kernel_client_factory = ThreadedKernelClient
 
     def _connection_file_default(self):
         return 'kernel-%i-%i.json' % (os.getpid(), self.childid)
@@ -42,6 +42,8 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
         self.init_kernel_client()
 
     def init_kernel_manager(self, proxy_kernel_manager):
+        self.proxy_kernel_manager = proxy_kernel_manager
+        self.kernel_client_class = proxy_kernel_manager.kernel_manager_factory.client_factory
         # Don't let Qt or ZMQ swallow KeyboardInterupts.
         if self.existing:
             self.kernel_manager = None
@@ -100,11 +102,18 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
                                 connection_file=self.connection_file,
                                 parent=self,
             )
-        self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
+        self.kernel_client.shell_channel.call_handlers = self.on_first_shell_msg
+        # self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
         self.kernel_client.iopub_channel.call_handlers = self.on_iopub_msg
         self.kernel_client.stdin_channel.call_handlers = self.on_stdin_msg
         self.kernel_client.hb_channel.call_handlers = self.on_hb_msg
         self.kernel_client.start_channels()
+
+    def on_first_shell_msg(self, msg):
+        """
+        first shell msg is always kernel_info, invoked by KernelClient.start_channels
+        """
+        self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
 
     def on_shell_msg(self, msg):
         pass
