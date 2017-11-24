@@ -9,6 +9,7 @@ from jupyter_core.application import JupyterApp
 from jupyter_client.consoleapp import JupyterConsoleApp, NoSuchKernel
 from jupyter_client.ioloop import IOLoopKernelManager
 from jupyter_core import version_info
+from traitlets import default
 
 from traceback import format_exc
 import atexit
@@ -26,6 +27,7 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
 
     # kernel_client_factory = ThreadedKernelClient
 
+    @default('connection_file')
     def _connection_file_default(self):
         return 'kernel-%i-%i.json' % (os.getpid(), self.childid)
 
@@ -42,13 +44,14 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
         self.init_kernel_client()
 
     def init_kernel_manager(self, proxy_kernel_manager):
-        self.proxy_kernel_manager = proxy_kernel_manager
-        self.kernel_client_class = proxy_kernel_manager.kernel_manager_factory.client_factory
         # Don't let Qt or ZMQ swallow KeyboardInterupts.
         if self.existing:
+            self.kernel_id = None
             self.kernel_manager = None
             return
 
+        self.proxy_kernel_manager = proxy_kernel_manager
+        self.kernel_client_class = proxy_kernel_manager.kernel_manager_factory.client_factory
         # Create a KernelManager and start a kernel.
         try:
             kwargs = {
@@ -63,8 +66,8 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
                     connection_file=self.connection_file,
                     data_dir=self.data_dir),
             }
-            kernel_id = proxy_kernel_manager.start_kernel(**kwargs)
-            self.kernel_manager = proxy_kernel_manager.get_kernel(kernel_id)
+            self.kernel_id = proxy_kernel_manager.start_kernel(**kwargs)
+            self.kernel_manager = proxy_kernel_manager.get_kernel(self.kernel_id)
 
         except NoSuchKernel:
             self.log.critical("Could not find kernel %s", self.kernel_name)
@@ -127,6 +130,12 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
     def on_hb_msg(self, msg):
         pass
 
+    def quit_app(self):
+        if self.kernel_id:
+            self.proxy_kernel_manager.shutdown_kernel(self.kernel_id)
+        if self.kernel_client:
+            self.kernel_client.stop_channels()
+
 
 class JupyterChildApp(JupyterApp, JupyterChildConsoleApp):
     kernel_manager_class = ThreadedIOLoopKernelManager
@@ -142,6 +151,16 @@ class JupyterChildApp(JupyterApp, JupyterChildConsoleApp):
         self.childid = childid
         super(JupyterChildApp, self).initialize(argv)
         JupyterChildConsoleApp.initialize(self, parent.kernel_manager, argv)
+
+
+def child_method(f):
+    def wrapped(self, childid, *args, **kwargs):
+        child = self.get_child_app(childid)
+        method = getattr(child, f.__name__)
+        rv = method(*args, **kwargs)
+        f(self, childid, *args, **kwargs)
+        return rv
+    return wrapped
 
 
 class JupyterContainerApp(JupyterApp):
@@ -176,7 +195,7 @@ class JupyterContainerApp(JupyterApp):
             parent=self,
             log=self.log,
         )
-        atexit.register(self.cleanup_kernels)
+        atexit.register(self.quit)
 
     def get_child_app(self, childid):
         return self._child_apps.get(childid)
@@ -189,15 +208,6 @@ class JupyterContainerApp(JupyterApp):
         if self._dispatching:
             return
         self.init_kernel_manager()
-
-    def cleanup_kernels(self):
-        """Shutdown all kernels.
-
-        The kernels will shutdown themselves when this process no longer exists,
-        but explicit shutdown allows the KernelManagers to cleanup the connection files.
-        """
-        self.log.info('shutting down all kernels')
-        self.kernel_manager.shutdown_all()
 
     def start_child_app(self, childid, argv=None, **kwargs):
         if childid in self:
@@ -213,3 +223,17 @@ class JupyterContainerApp(JupyterApp):
         self._child_apps[childid] = childapp
         self._child_clients[childid] = childapp.kernel_client
         return childapp
+
+    @child_method
+    def quit_app(self, childid):
+        """Quit child app: shutdown its kernel, stop the client channels"""
+        self._child_apps.pop(childid)
+
+    @child_method
+    def execute(self, childid, *args, **kwargs):
+        """execute in child app"""
+
+    def quit(self):
+        for childid in list(self._child_apps):
+            self.quit_app(childid)
+        self.kernel_manager.shutdown_all()
