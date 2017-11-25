@@ -21,6 +21,90 @@ from jupyter_container.kernelmanager import (
 from jupyter_container import __version__
 
 
+def child_method(f):
+    def wrapped(self, childid, *args, **kwargs):
+        child = self[childid]
+        method = getattr(child, f.__name__)
+        rv = method(*args, **kwargs)
+        f(self, childid, *args, **kwargs)
+        return rv
+    return wrapped
+
+
+def child_client_method(action=None):
+    """
+    call client_method with all args, call action on the result
+    then call f with all args. returns what f returned
+    """
+    def wrapper(f):
+        def wrapped(self, childid, *args, **kwargs):
+            assert '_rv' not in kwargs, 'kwargs should not contain _rv'
+            child_app = self[childid]
+            child_client_method = getattr(child_app.kernel_client, f.__name__)
+            client_rv = child_client_method(*args, **kwargs)
+            self.log.info('%s: %s', f.__name__, client_rv)
+            if action == 'shell' and hasattr(child_app, 'shell_send_callback'):
+                child_app.shell_send_callback(client_rv)
+            rv = f(self, childid, *args, **kwargs)
+            return rv
+        return wrapped
+    return wrapper
+
+
+class ClientMethodMixin:
+    def initialize(self, shell_send_callback):
+        self.shell_send_callback = shell_send_callback
+
+    # is_alive
+    @child_client_method('shell')
+    def execute(self, childid, *args, **kwargs):
+        """execute"""
+
+    @child_client_method('shell')
+    def complete(self, childid, *args, **kwargs):
+        """complete"""
+
+    @child_client_method('shell')
+    def inspect(self, childid, *args, **kwargs):
+        """inspect"""
+
+    @child_client_method('shell')
+    def history(self, childid, *args, **kwargs):
+        """history"""
+
+    @child_client_method('shell')
+    def kernel_info(self, childid, *args, **kwargs):
+        """kernel_info"""
+
+    # TODO: what to do
+    # @child_client_method('shell')
+    # def comm_info(self, childid, *args, **kwargs):
+    #     """comm_info"""
+
+    # TODO: what to do
+    # @child_client_method('shell')
+    # def shutdown(self, childid, *args, **kwargs):
+    #     """shutdown"""
+
+    @child_client_method('shell')
+    def is_complete(self, childid, *args, **kwargs):
+        """is_complete"""
+
+    @child_client_method()
+    def input(self, childid, *args, **kwargs):
+        """input"""
+
+    def __call__(self, method, *args, **kwargs):
+        childid = kwargs.pop('childid', self.current_child())
+        has_method = method in [
+            'execute', 'complete', 'inspect', 'history', 'kernel_info',
+            # 'comm_info', 'shutdown',
+            'is_complete']
+        if childid is not None and has_method:
+            return getattr(self, method)(childid, *args, **kwargs)
+        else:
+            return None
+
 class JupyterChildConsoleApp(JupyterConsoleApp):
     aliases = JupyterConsoleApp.aliases
     flags = JupyterConsoleApp.flags
@@ -153,17 +237,7 @@ class JupyterChildApp(JupyterApp, JupyterChildConsoleApp):
         JupyterChildConsoleApp.initialize(self, parent.kernel_manager, argv)
 
 
-def child_method(f):
-    def wrapped(self, childid, *args, **kwargs):
-        child = self.get_child_app(childid)
-        method = getattr(child, f.__name__)
-        rv = method(*args, **kwargs)
-        f(self, childid, *args, **kwargs)
-        return rv
-    return wrapped
-
-
-class JupyterContainerApp(JupyterApp):
+class JupyterContainerApp(JupyterApp, ClientMethodMixin):
     name = 'jupyter-container-app'
     version = __version__
     description = """
@@ -190,16 +264,15 @@ class JupyterContainerApp(JupyterApp):
     def __contains__(self, childid):
         return childid in self._child_apps
 
+    def __getitem__(self, childid):
+        return self._child_apps.get(childid)
+
     def init_kernel_manager(self):
         self.kernel_manager = self.kernel_manager_factory(
             parent=self,
             log=self.log,
         )
         atexit.register(self.quit)
-
-    def get_child_app(self, childid):
-        return self._child_apps.get(childid)
-
 
     def initialize(self, argv=None):
         self._child_apps = {}
@@ -229,11 +302,14 @@ class JupyterContainerApp(JupyterApp):
         """Quit child app: shutdown its kernel, stop the client channels"""
         self._child_apps.pop(childid)
 
-    @child_method
-    def execute(self, childid, *args, **kwargs):
-        """execute in child app"""
-
     def quit(self):
         for childid in list(self._child_apps):
             self.quit_app(childid)
         self.kernel_manager.shutdown_all()
+
+    def current_child(self):
+        """
+        used by self.__call__ (from ClientMethodMixin)
+        subclass can choose to provide this if it is meaningful
+        """
+        pass
