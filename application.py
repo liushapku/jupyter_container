@@ -13,6 +13,7 @@ from traitlets import default
 
 from traceback import format_exc
 import atexit
+from tornado.concurrent import Future
 
 from jupyter_container.kernelmanager import (
     ProxyMultiKernelManager,
@@ -20,6 +21,17 @@ from jupyter_container.kernelmanager import (
 )
 from jupyter_container import __version__
 
+def catch_exception(f):
+    def wrapper(self, *args, **kwargs):
+        try:
+            return f(self, *args, **kwargs)
+        except Exception as ex:
+            self.log.error('==== EXCEPTION %s', ex)
+            buf = io.StringIO()
+            traceback.print_tb(sys.exc_info()[2], limit=None, file=buf)
+            self.log.error(buf.getvalue())
+
+    return wrapper
 
 def child_method(f):
     def wrapped(self, childid, *args, **kwargs):
@@ -122,6 +134,7 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
         """
         if self._dispatching:
             return
+        self.started = False
         self.init_connection_file()
         self.init_ssh()
         self.init_kernel_manager(proxy_kernel_manager)
@@ -189,18 +202,67 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
                                 connection_file=self.connection_file,
                                 parent=self,
             )
-        self.kernel_client.shell_channel.call_handlers = self.on_first_shell_msg
-        # self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
-        self.kernel_client.iopub_channel.call_handlers = self.on_iopub_msg
+        self._kernel_info_done = set()
+        self.kernel_client.shell_channel.call_handlers = self._on_kernel_info
+        self.kernel_client.iopub_channel.call_handlers = self._on_kernel_info
         self.kernel_client.stdin_channel.call_handlers = self.on_stdin_msg
         self.kernel_client.hb_channel.call_handlers = self.on_hb_msg
+        # KernelClient.start_channels() fires kernel_info()
+        # ThreadedKernelClient adds a _inspect for kernel_info before at the beginning of start_channels
         self.kernel_client.start_channels()
 
-    def on_first_shell_msg(self, msg):
+
+    @catch_exception
+    def _on_kernel_info(self, msg):
         """
         first shell msg is always kernel_info, invoked by KernelClient.start_channels
         """
+        if msg['msg_type'] == 'kernel_info_reply':
+            self.kernel_info = msg['content']
+            if 'iopub' in self._kernel_info_done:
+                self._on_finish_kernel_info()
+            else:
+                self._kernel_info_done.add('shell')
+        elif msg['msg_type'] == 'status':
+            state = msg['content']['execution_state']
+            self.set_status(state)
+            if state == 'starting':
+                pass
+            elif state == 'busy':
+                assert msg['parent_header']['msg_type'] == 'kernel_info_request'
+            elif state == 'idle':
+                assert msg['parent_header']['msg_type'] == 'kernel_info_request'
+                if 'shell' in self._kernel_info_done:
+                    self._on_finish_kernel_info()
+                else:
+                    self._kernel_info_done.add('iopub')
+            else:
+                self.log.warning('unexpected iopub status %s', msg)
+        else:
+            # may be some stream information from iopub during ipython initialization
+            if not hasattr(self, '_pending_iopub_msg'):
+                self._pending_iopub_msg = []
+            self._pending_iopub_msg.append(msg)
+
+    def set_status(state):
+        """
+        overwrite this to update the state
+        """
+        self.status = state
+
+    def _on_finish_kernel_info(self):
+        """
+        overwrite this
+        """
+        delattr(self, '_kernel_info_done')
         self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
+        pending_iopub_msg = self.__dict__.pop('_pending_iopub_msg', [])
+        self.on_finish_kernel_info(self.kernel_info, pending_iopub_msg)
+        self.kernel_client.iopub_channel.call_handlers = self.on_iopub_msg
+
+    def on_finish_kernel_info(self, kernel_info, pending_iopub_msg):
+        for msg in pending_iopub_msg:
+            self.log.info('iopub msg received before starting %s', msg)
 
     def on_shell_msg(self, msg):
         pass
