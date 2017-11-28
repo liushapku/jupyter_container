@@ -1,5 +1,8 @@
 from __future__ import print_function, division
+import io
 import os
+import sys
+import traceback
 import signal
 
 from jupyter_client import KernelManager
@@ -11,7 +14,6 @@ from jupyter_client.ioloop import IOLoopKernelManager
 from jupyter_core import version_info
 from traitlets import default
 
-from traceback import format_exc
 import atexit
 from tornado.concurrent import Future
 
@@ -26,37 +28,35 @@ def catch_exception(f):
         try:
             return f(self, *args, **kwargs)
         except Exception as ex:
-            self.log.error('==== EXCEPTION %s', ex)
             buf = io.StringIO()
-            traceback.print_tb(sys.exc_info()[2], limit=None, file=buf)
-            self.log.error(buf.getvalue())
+            traceback.print_exc(limit=None, file=buf)
+            self.log.error('==== EXCEPTION in %s %s, %s', self, f.__name__, buf.getvalue())
 
     return wrapper
 
 def child_method(f):
     def wrapped(self, childid, *args, **kwargs):
-        child = self[childid]
-        method = getattr(child, f.__name__)
-        rv = method(*args, **kwargs)
-        f(self, childid, *args, **kwargs)
-        return rv
+        if childid in self:
+            child = self[childid]
+            method = getattr(child, f.__name__)
+            rv = method(*args, **kwargs)
+            f(self, childid, *args, **kwargs)
+            return rv
     return wrapped
 
 
-def child_client_method(action=None):
+def child_client_method(is_shell=True):
     """
     call client_method with all args, call action on the result
     then call f with all args. returns what f returned
     """
     def wrapper(f):
         def wrapped(self, childid, *args, **kwargs):
-            assert '_rv' not in kwargs, 'kwargs should not contain _rv'
             child_app = self[childid]
             child_client_method = getattr(child_app.kernel_client, f.__name__)
             client_rv = child_client_method(*args, **kwargs)
-            self.log.info('%s: %s', f.__name__, client_rv)
-            if action == 'shell' and hasattr(child_app, 'shell_send_callback'):
-                child_app.shell_send_callback(client_rv)
+            if is_shell:
+                child_app.shell_send_callback(f.__name__, client_rv)
             rv = f(self, childid, *args, **kwargs)
             return rv
         return wrapped
@@ -64,55 +64,60 @@ def child_client_method(action=None):
 
 
 class ClientMethodMixin:
-    def initialize(self, shell_send_callback):
-        self.shell_send_callback = shell_send_callback
+    def shell_send_callback(self, msgid):
+        """
+        callback for each shell request sent
+        """
+        pass
 
     # is_alive
-    @child_client_method('shell')
+    @child_client_method()
     def execute(self, childid, *args, **kwargs):
         """execute"""
 
-    @child_client_method('shell')
+    @child_client_method()
     def complete(self, childid, *args, **kwargs):
         """complete"""
 
-    @child_client_method('shell')
+    @child_client_method()
     def inspect(self, childid, *args, **kwargs):
         """inspect"""
 
-    @child_client_method('shell')
+    @child_client_method()
     def history(self, childid, *args, **kwargs):
         """history"""
 
-    @child_client_method('shell')
+    @child_client_method()
     def kernel_info(self, childid, *args, **kwargs):
         """kernel_info"""
 
     # TODO: what to do
-    # @child_client_method('shell')
+    # @child_client_method()
     # def comm_info(self, childid, *args, **kwargs):
     #     """comm_info"""
 
     # TODO: what to do
-    # @child_client_method('shell')
+    # @child_client_method()
     # def shutdown(self, childid, *args, **kwargs):
     #     """shutdown"""
 
-    @child_client_method('shell')
+    @child_client_method()
     def is_complete(self, childid, *args, **kwargs):
         """is_complete"""
 
-    @child_client_method()
+    @child_client_method(is_shell=False)
     def input(self, childid, *args, **kwargs):
         """input"""
 
     def __call__(self, method, *args, **kwargs):
-        childid = kwargs.pop('childid', self.current_child())
+        childid = kwargs.pop('childid', None)
+        if childid is None:
+            childid = self.current_child()
         has_method = method in [
             'execute', 'complete', 'inspect', 'history', 'kernel_info',
             # 'comm_info', 'shutdown',
             'is_complete']
-        if childid is not None and has_method:
+        if childid in self._child_apps and has_method:
             return getattr(self, method)(childid, *args, **kwargs)
         else:
             return None
@@ -125,7 +130,7 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
 
     @default('connection_file')
     def _connection_file_default(self):
-        return 'kernel-%i-%i.json' % (os.getpid(), self.childid)
+        return 'kernel-%i-%s.json' % (os.getpid(), self.childid)
 
     def initialize(self, proxy_kernel_manager, argv=None):
         """
@@ -203,8 +208,10 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
                                 parent=self,
             )
         self._kernel_info_done = set()
-        self.kernel_client.shell_channel.call_handlers = self._on_kernel_info
-        self.kernel_client.iopub_channel.call_handlers = self._on_kernel_info
+        self.pending_shell_msg = []
+        self.pending_iopub_msg = []
+        self.kernel_client.shell_channel.call_handlers = self._on_kernel_info_shell
+        self.kernel_client.iopub_channel.call_handlers = self._on_kernel_info_iopub
         self.kernel_client.stdin_channel.call_handlers = self.on_stdin_msg
         self.kernel_client.hb_channel.call_handlers = self.on_hb_msg
         # KernelClient.start_channels() fires kernel_info()
@@ -213,19 +220,24 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
 
 
     @catch_exception
-    def _on_kernel_info(self, msg):
+    def _on_kernel_info_shell(self, msg):
         """
         first shell msg is always kernel_info, invoked by KernelClient.start_channels
         """
-        if msg['msg_type'] == 'kernel_info_reply':
+        if msg['msg_type'] == 'kernel_info_reply' and 'shell' not in self._kernel_info_done:
             self.kernel_info = msg['content']
             if 'iopub' in self._kernel_info_done:
                 self._on_finish_kernel_info()
             else:
                 self._kernel_info_done.add('shell')
-        elif msg['msg_type'] == 'status':
+        else:
+            self.pending_shell_msg.append(msg)
+
+    @catch_exception
+    def _on_kernel_info_iopub(self, msg):
+        if msg['msg_type'] == 'status' and 'iopub' not in self._kernel_info_done:
             state = msg['content']['execution_state']
-            self.set_status(state)
+            self.set_state(state)
             if state == 'starting':
                 pass
             elif state == 'busy':
@@ -238,17 +250,16 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
                     self._kernel_info_done.add('iopub')
             else:
                 self.log.warning('unexpected iopub status %s', msg)
+
         else:
             # may be some stream information from iopub during ipython initialization
-            if not hasattr(self, '_pending_iopub_msg'):
-                self._pending_iopub_msg = []
-            self._pending_iopub_msg.append(msg)
+            self.pending_iopub_msg.append(msg)
 
-    def set_status(state):
+    def set_state(self, state):
         """
         overwrite this to update the state
         """
-        self.status = state
+        self.state = state
 
     def _on_finish_kernel_info(self):
         """
@@ -256,8 +267,7 @@ class JupyterChildConsoleApp(JupyterConsoleApp):
         """
         delattr(self, '_kernel_info_done')
         self.kernel_client.shell_channel.call_handlers = self.on_shell_msg
-        pending_iopub_msg = self.__dict__.pop('_pending_iopub_msg', [])
-        self.on_finish_kernel_info(self.kernel_info, pending_iopub_msg)
+        self.on_finish_kernel_info()
         self.kernel_client.iopub_channel.call_handlers = self.on_iopub_msg
 
     def on_finish_kernel_info(self, kernel_info, pending_iopub_msg):
@@ -346,12 +356,10 @@ class JupyterContainerApp(JupyterApp, ClientMethodMixin):
 
     def start_child_app(self, childid, argv=None, **kwargs):
         if childid in self:
-            assert argv is None or '--existing' not in argv, \
-                'chilid is already associated with a kernel, --existing is not valid'
-            logger.warning('BufApp %d already started', childid)
+            self.log.warning('child app %s already started', childid)
             return self._child_apps[childid]
-        if 'log' not in kwargs:
-            kwargs['log'] = self.log
+
+        kwargs.setdefault('log', self.log)
         childapp = self.child_app_factory(**kwargs)
         childapp.initialize(self, childid, argv)
 
@@ -365,6 +373,9 @@ class JupyterContainerApp(JupyterApp, ClientMethodMixin):
         self._child_apps.pop(childid)
 
     def quit(self):
+        """
+        quit container app, will quit all child apps
+        """
         for childid in list(self._child_apps):
             self.quit_app(childid)
         self.kernel_manager.shutdown_all()
